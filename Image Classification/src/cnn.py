@@ -1,5 +1,6 @@
 from pathlib import Path
 import pickle
+from sys import path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -93,6 +94,67 @@ def preprocess_data(images, labels):
     return images, labels
 
 
+def print_train_data_features():
+    """Read and print all features of the train data."""
+    print("="*80)
+    print("TRAIN DATA FEATURES ANALYSIS")
+    print("="*80)
+    
+    # Load raw train data
+    train_images, train_labels, label_names, filenames = load_cifar100(split="train")
+    
+    print("\n1. DATASET SHAPE AND SIZE:")
+    print(f"   Number of training samples: {len(train_images)}")
+    print(f"   Image shape (raw): {train_images.shape}")
+    print(f"   Labels shape: {train_labels.shape}")
+    print(f"   Number of unique classes: {len(label_names)}")
+    print(f"   Image dimensions (H x W x C): {train_images[0].shape}")
+    
+    print("\n2. DATA TYPES:")
+    print(f"   Images dtype: {train_images.dtype}")
+    print(f"   Labels dtype: {train_labels.dtype}")
+    print(f"   Labels data: {type(train_labels)}")
+    
+    print("\n3. IMAGE PIXEL VALUE STATISTICS:")
+    print(f"   Min pixel value: {train_images.min()}")
+    print(f"   Max pixel value: {train_images.max()}")
+    print(f"   Mean pixel value: {train_images.mean():.4f}")
+    print(f"   Std pixel value: {train_images.std():.4f}")
+    
+    print("\n4. LABEL DISTRIBUTION:")
+    unique_labels, counts = np.unique(train_labels, return_counts=True)
+    print(f"   Unique labels: {len(unique_labels)}")
+    print(f"   Min samples per class: {counts.min()}")
+    print(f"   Max samples per class: {counts.max()}")
+    print(f"   Mean samples per class: {counts.mean():.2f}")
+    print(f"   Std samples per class: {counts.std():.2f}")
+    
+    print("\n5. CLASS NAMES:")
+    for i, name in enumerate(label_names[:20]):
+        print(f"   Class {i}: {name}")
+    print(f"   ... and {len(label_names) - 20} more classes")
+    
+    print("\n6. MEMORY USAGE:")
+    images_memory = train_images.nbytes / (1024**2)
+    labels_memory = train_labels.nbytes / (1024**2)
+    total_memory = images_memory + labels_memory
+    print(f"   Images memory: {images_memory:.2f} MB")
+    print(f"   Labels memory: {labels_memory:.2f} MB")
+    print(f"   Total memory: {total_memory:.2f} MB")
+    
+    print("\n7. SAMPLE LABELS AND FILENAMES:")
+    for i in range(min(10, len(train_labels))):
+        print(f"   Sample {i}: Label={train_labels[i]} ({label_names[train_labels[i]]}), Filename={filenames[i]}")
+    
+    print("\n8. CHANNEL-WISE STATISTICS:")
+    for c in range(3):
+        channel_data = train_images[:, :, :, c]
+        print(f"   Channel {c} - Min: {channel_data.min()}, Max: {channel_data.max()}, Mean: {channel_data.mean():.4f}")
+    
+    print("="*80 + "\n")
+
+
+
 def train_model(model, train_loader, criterion, optimizer, num_epochs=10, device='cpu'):
     model.to(device)
     model.train()
@@ -142,6 +204,18 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
+    # Uncommet this to understand data configuration and features before training - start
+    # Print train data features and analysis
+    # print_train_data_features()
+    
+    # Show sample images
+    # print("Showing train images...")
+    # show_sample_images(split="train", num_samples=12)
+    
+    # print("Showing test images...")
+    # show_sample_images(split="test", num_samples=12)
+    # Uncommet this to understand data configuration and features before training - ends
+    
     # Load and preprocess training data from train path
     train_path = DATASET_DIR / "train"
     print(f"Loading training data from: {train_path}")
@@ -175,9 +249,4 @@ if __name__ == "__main__":
     print("Evaluating on test set...")
     evaluate_model(model, test_loader, device=device)
     
-    # # Show sample images
-    # print("Showing train images...")
-    # show_sample_images(split="train", num_samples=12)
-    
-    # print("Showing test images...")
-    # show_sample_images(split="test", num_samples=12)
+   
