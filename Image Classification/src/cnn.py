@@ -322,7 +322,7 @@ def compute_metrics(y_true, y_pred, prefix='Metrics', average='macro', print_res
 
 
 def print_confusion_matrix(cm, prefix='Confusion Matrix'):
-    print(f"\n{prefix} (shape={cm.shape}):")
+    # print(f"\n{prefix} (shape={cm.shape}):")
     old_opts = np.get_printoptions()
     np.set_printoptions(threshold=10000, linewidth=200)
     print(cm)
@@ -383,11 +383,203 @@ def evaluate_model(model, data_loader, device='cpu', prefix='Test', return_confu
     return metrics
 
 
+# ================================ NOISE INJECTION FOR ROBUSTNESS TESTING ================================
+
+class NoiseSchedule:
+    """
+    Noise schedule configuration for robustness testing.
+    Stores noise generation parameters for reproducibility.
+    """
+    def __init__(self, noise_type='gaussian', variance=0.05, mean=0.0):
+        self.noise_type = noise_type
+        self.variance = variance
+        self.mean = mean
+        self.std = np.sqrt(variance)
+    
+    def __repr__(self):
+        return f"NoiseSchedule(type={self.noise_type}, variance={self.variance:.4f}, mean={self.mean:.4f}, std={self.std:.4f})"
+    
+    def to_dict(self):
+        return {
+            'noise_type': self.noise_type,
+            'variance': self.variance,
+            'mean': self.mean,
+            'std': self.std,
+        }
+
+
+def generate_noisy_images(images, noise_schedule):
+    """
+    Generate noisy images by injecting additive Gaussian noise.
+    
+    Parameters:
+    -----------
+    images : np.ndarray
+        Input images (normalized to [0, 1]), shape (N, H, W, C) or (N, C, H, W)
+    noise_schedule : NoiseSchedule
+        Noise configuration with variance and mean
+    
+    Returns:
+    --------
+    noisy_images : np.ndarray
+        Images with injected noise, clipped to [0, 1]
+    """
+    if noise_schedule.noise_type != 'gaussian':
+        raise ValueError(f"Only Gaussian noise is currently supported, got {noise_schedule.noise_type}")
+    
+    # Handle both (N, H, W, C) and (N, C, H, W) formats
+    if images.shape[1] in [3, 4]:  # Assuming C in [3, 4]
+        # (N, C, H, W) format - transpose to (N, H, W, C)
+        images = images.permute(0, 2, 3, 1).numpy() if isinstance(images, torch.Tensor) else images.transpose(0, 2, 3, 1)
+    elif isinstance(images, torch.Tensor):
+        images = images.numpy()
+    
+    # Generate Gaussian noise: N(mean, variance)
+    noise = np.random.normal(
+        loc=noise_schedule.mean,
+        scale=noise_schedule.std,
+        size=images.shape
+    )
+    
+    # Add noise to images
+    noisy_images = images + noise
+    
+    # Clip to valid range [0, 1]
+    noisy_images = np.clip(noisy_images, 0.0, 1.0)
+    
+    return noisy_images
+
+
+def create_noisy_dataloader(test_images, test_labels, noise_schedule, batch_size=64):
+    """
+    Create a DataLoader with noisy images for robustness testing.
+    
+    Parameters:
+    -----------
+    test_images : torch.Tensor
+        Original test images, shape (N, C, H, W), normalized to [0, 1]
+    test_labels : torch.Tensor
+        Test labels
+    noise_schedule : NoiseSchedule
+        Noise configuration
+    batch_size : int
+        Batch size for DataLoader
+    
+    Returns:
+    --------
+    noisy_loader : DataLoader
+        DataLoader with noisy images
+    """
+    # Convert to numpy if needed
+    if isinstance(test_images, torch.Tensor):
+        images_np = test_images.permute(0, 2, 3, 1).numpy()
+    else:
+        images_np = test_images
+    
+    # Generate noisy images
+    noisy_images_np = generate_noisy_images(images_np, noise_schedule)
+    
+    # Convert back to torch tensor with correct format (N, C, H, W)
+    noisy_images_tensor = torch.tensor(noisy_images_np, dtype=torch.float32).permute(0, 3, 1, 2)
+    
+    # Create dataset and loader
+    noisy_dataset = TensorDataset(noisy_images_tensor, test_labels)
+    noisy_loader = DataLoader(noisy_dataset, batch_size=batch_size, shuffle=False)
+    
+    return noisy_loader
+
+
+def evaluate_robustness(model, test_images, test_labels, noise_schedule, batch_size=64, device='cpu'):
+    """
+    Evaluate model robustness to noise by testing on noisy images.
+    
+    Parameters:
+    -----------
+    model : nn.Module
+        Trained CNN model
+    test_images : torch.Tensor
+        Original test images
+    test_labels : torch.Tensor
+        Test labels
+    noise_schedule : NoiseSchedule
+        Noise configuration
+    batch_size : int
+        Batch size for evaluation
+    device : str or torch.device
+        Device to run evaluation on
+    
+    Returns:
+    --------
+    clean_metrics : dict
+        Metrics on clean images
+    noisy_metrics : dict
+        Metrics on noisy images
+    degradation : dict
+        Performance degradation (clean - noisy)
+    """
+    # Create clean test loader
+    clean_dataset = TensorDataset(test_images, test_labels)
+    clean_loader = DataLoader(clean_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Evaluate on clean images
+    clean_metrics = evaluate_model(model, clean_loader, device=device, prefix='Clean Test')
+    
+    # Create noisy test loader and evaluate
+    noisy_loader = create_noisy_dataloader(test_images, test_labels, noise_schedule, batch_size)
+    noisy_metrics = evaluate_model(model, noisy_loader, device=device, prefix=f'Noisy Test (σ²={noise_schedule.variance})')
+    
+    # Calculate degradation
+    degradation = {
+        'accuracy': clean_metrics['accuracy'] - noisy_metrics['accuracy'],
+        'precision': clean_metrics['precision'] - noisy_metrics['precision'],
+        'recall': clean_metrics['recall'] - noisy_metrics['recall'],
+        'f1': clean_metrics['f1'] - noisy_metrics['f1'],
+    }
+    
+    return clean_metrics, noisy_metrics, degradation
+
+
+def print_robustness_report(clean_metrics, noisy_metrics, degradation, noise_schedule):
+    """Print a formatted robustness evaluation report."""
+    print("\n" + "="*100)
+    print("ROBUSTNESS EVALUATION REPORT - GAUSSIAN NOISE INJECTION")
+    print("="*100)
+    print(f"\nNoise Configuration: {noise_schedule}")
+    print(f"  - Type: {noise_schedule.noise_type}")
+    print(f"  - Mean: {noise_schedule.mean}")
+    print(f"  - Variance (σ²): {noise_schedule.variance}")
+    print(f"  - Std Dev (σ): {noise_schedule.std:.4f}")
+    
+    print("\n" + "-"*100)
+    print("PERFORMANCE METRICS")
+    print("-"*100)
+    print(f"{'Metric':<20} {'Clean Images':<20} {'Noisy Images':<20} {'Degradation':<20}")
+    print("-"*100)
+    print(f"{'Accuracy (%)':<20} {clean_metrics['accuracy']:<20.2f} {noisy_metrics['accuracy']:<20.2f} {degradation['accuracy']:<20.2f}")
+    print(f"{'Precision (macro)':<20} {clean_metrics['precision']:<20.2f} {noisy_metrics['precision']:<20.2f} {degradation['precision']:<20.2f}")
+    print(f"{'Recall (macro)':<20} {clean_metrics['recall']:<20.2f} {noisy_metrics['recall']:<20.2f} {degradation['recall']:<20.2f}")
+    print(f"{'F1-Score (macro)':<20} {clean_metrics['f1']:<20.2f} {noisy_metrics['f1']:<20.2f} {degradation['f1']:<20.2f}")
+    print("-"*100)
+    
+    # Calculate robustness percentage
+    robustness_pct = (noisy_metrics['accuracy'] / clean_metrics['accuracy'] * 100) if clean_metrics['accuracy'] > 0 else 0
+    print(f"\nRobustness to Noise: {robustness_pct:.2f}% (Noisy Accuracy / Clean Accuracy)")
+    print("="*100 + "\n")
+
+
 if __name__ == "__main__":
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
+
+#     Question A1. Design and train a convolutional neural network from scratch for image
+# classification on the CIFAR-100 dataset. The network should be of moderate size and
+# computationally feasible to train using available resources. Clearly describe the archi-
+# tecture, including the number of convolutional layers, kernel sizes, activation functions,
+# and pooling operations. Train the model and report the training and validation accuracy.
+# Comment on the convergence behavior and overall performance. ---------------------------------STARTS HERE
+
     # Print CNN architecture description
     print_cnn_architecture()
     
@@ -438,5 +630,44 @@ if __name__ == "__main__":
     
     print("Final evaluation on test set...")
     test_metrics, test_cm = evaluate_model(model, test_loader, device=device, prefix='Final Test', return_confusion=True)
+
+    #Question A1 ---------------------------------ENDS HERE
+
+    # ============================= QUESTION A2: ROBUSTNESS TO NOISE ============================
+    print("\n\n" + "="*100)
+    print("QUESTION A2: MODEL ROBUSTNESS TO ADDITIVE GAUSSIAN NOISE")
+    print("="*100)
+    
+    # Define noise schedule for robustness testing
+    # Noise parameters: zero-mean Gaussian with variance σ² = 0.05
+    noise_schedule = NoiseSchedule(
+        noise_type='gaussian',
+        variance=0.05,  # σ² = 0.05
+        mean=0.0        # zero-mean
+    )
+    
+    print(f"\nNoise Configuration:")
+    print(f"  - Type: {noise_schedule.noise_type}")
+    print(f"  - Mean: {noise_schedule.mean}")
+    print(f"  - Variance (σ²): {noise_schedule.variance}")
+    print(f"  - Std Dev (σ): {noise_schedule.std:.4f}")
+    
+    # Evaluate robustness on test set
+    clean_metrics, noisy_metrics, degradation = evaluate_robustness(
+        model, test_images, test_labels, noise_schedule, batch_size=64, device=device
+    )
+    
+    # Print robustness report
+    print_robustness_report(clean_metrics, noisy_metrics, degradation, noise_schedule)
+
+#     Question A2. Using the trained model from Question A1, evaluate robustness to noise
+# by injecting additive Gaussian noise into the test images. Use zero-mean Gaussian noise
+# with variance σ2 = 0.05, assuming input images are normalized to the range [0,1]. Test
+# the model on the noisy test set and report the resulting performance. Clearly document
+# and store the noise generation process and parameters (noise schedule), as this will be
+# reused in subsequent experiments. ---------------------------------STARTS HERE
+
+
+
     
    
