@@ -1,14 +1,13 @@
 from pathlib import Path
 import pickle
-from sys import path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
 
 
 DATASET_DIR = Path(__file__).resolve().parent.parent / "cifar-100-python"
@@ -307,13 +306,36 @@ def print_train_data_features():
 
 
 
-def train_model(model, train_loader, criterion, optimizer, num_epochs=10, device='cpu'):
+def compute_metrics(y_true, y_pred, prefix='Metrics', average='macro', print_results=True):
+    accuracy = accuracy_score(y_true, y_pred) * 100
+    precision = precision_score(y_true, y_pred, average=average, zero_division=0) * 100
+    recall = recall_score(y_true, y_pred, average=average, zero_division=0) * 100
+    f1 = f1_score(y_true, y_pred, average=average, zero_division=0) * 100
+    if print_results:
+        print(f"{prefix} -> Accuracy: {accuracy:.2f}%, Precision ({average}): {precision:.2f}%, Recall ({average}): {recall:.2f}%, F1 ({average}): {f1:.2f}%")
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+    }
+
+
+def print_confusion_matrix(cm, prefix='Confusion Matrix'):
+    print(f"\n{prefix} (shape={cm.shape}):")
+    old_opts = np.get_printoptions()
+    np.set_printoptions(threshold=10000, linewidth=200)
+    print(cm)
+    np.set_printoptions(**old_opts)
+
+
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=10, device='cpu'):
     model.to(device)
-    model.train()
     for epoch in range(num_epochs):
+        model.train()
         running_loss = 0.0
-        correct = 0
-        total = 0
+        all_labels = []
+        all_preds = []
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             
@@ -325,30 +347,40 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs=10, device
             
             running_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(predicted.cpu().numpy())
         
         epoch_loss = running_loss / len(train_loader)
-        epoch_acc = 100 * correct / total
-        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
+        y_true = np.concatenate(all_labels)
+        y_pred = np.concatenate(all_preds)
+        metrics = compute_metrics(y_true, y_pred, prefix=f'Train Epoch {epoch+1}', print_results=False)
+        test_metrics = evaluate_model(model, test_loader, device=device, prefix=f'Test Epoch {epoch+1}')
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+        print(f"  Train -> Accuracy: {metrics['accuracy']:.2f}%, Precision: {metrics['precision']:.2f}%, Recall: {metrics['recall']:.2f}%, F1: {metrics['f1']:.2f}%")
+        print(f"  Test  -> Accuracy: {test_metrics['accuracy']:.2f}%, Precision: {test_metrics['precision']:.2f}%, Recall: {test_metrics['recall']:.2f}%, F1: {test_metrics['f1']:.2f}%")
 
 
-def evaluate_model(model, test_loader, device='cpu'):
+def evaluate_model(model, data_loader, device='cpu', prefix='Test', return_confusion=False):
     model.to(device)
     model.eval()
-    correct = 0
-    total = 0
+    all_labels = []
+    all_preds = []
     with torch.no_grad():
-        for inputs, labels in test_loader:
+        for inputs, labels in data_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(predicted.cpu().numpy())
     
-    accuracy = 100 * correct / total
-    print(f'Test Accuracy: {accuracy:.2f}%')
-    return accuracy
+    y_true = np.concatenate(all_labels)
+    y_pred = np.concatenate(all_preds)
+    metrics = compute_metrics(y_true, y_pred, prefix=prefix)
+    cm = confusion_matrix(y_true, y_pred)
+    if return_confusion:
+        # print_confusion_matrix(cm, prefix=f'{prefix} Confusion Matrix')
+        return metrics, cm
+    return metrics
 
 
 if __name__ == "__main__":
@@ -398,10 +430,13 @@ if __name__ == "__main__":
     
     # Train the model
     print("Starting training...")
-    train_model(model, train_loader, criterion, optimizer, num_epochs=10, device=device)
+    train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=3, device=device)
     
-    # Evaluate the model
-    print("Evaluating on test set...")
-    evaluate_model(model, test_loader, device=device)
+    # Final evaluation
+    print("Final evaluation on train set...")
+    train_metrics, train_cm = evaluate_model(model, train_loader, device=device, prefix='Final Train', return_confusion=True)
+    
+    print("Final evaluation on test set...")
+    test_metrics, test_cm = evaluate_model(model, test_loader, device=device, prefix='Final Test', return_confusion=True)
     
    
