@@ -567,6 +567,196 @@ def print_robustness_report(clean_metrics, noisy_metrics, degradation, noise_sch
     print("="*100 + "\n")
 
 
+# ================================ NOISE-AUGMENTED TRAINING STRATEGY ================================
+
+def create_augmented_training_loader(train_images, train_labels, noise_schedule, augmentation_ratio=0.2, batch_size=64):
+    """
+    Create augmented training dataset with noise-perturbed samples.
+    
+    Strategy:
+    - Keep (1 - augmentation_ratio) of samples clean
+    - Add augmentation_ratio fraction of noise-perturbed duplicates
+    - Maintains distribution close to clean dataset while adding noise robustness
+    
+    Parameters:
+    -----------
+    train_images : torch.Tensor
+        Training images (N, C, H, W), normalized to [0, 1]
+    train_labels : torch.Tensor
+        Training labels
+    noise_schedule : NoiseSchedule
+        Noise configuration
+    augmentation_ratio : float
+        Fraction of samples to augment (default 0.2 = 20%)
+    batch_size : int
+        Batch size for DataLoader
+    
+    Returns:
+    --------
+    augmented_loader : DataLoader
+        DataLoader with mixed clean and noisy samples
+    """
+    if isinstance(train_images, torch.Tensor):
+        images_np = train_images.permute(0, 2, 3, 1).numpy()
+    else:
+        images_np = train_images
+    
+    n_samples = len(images_np)
+    n_augment = max(1, int(n_samples * augmentation_ratio))
+    
+    # Randomly select indices for augmentation
+    augment_indices = np.random.choice(n_samples, size=n_augment, replace=False)
+    
+    # Create augmented images: generate noise for selected samples
+    augmented_images = []
+    augmented_labels = []
+    
+    for i in range(n_samples):
+        # Add clean sample
+        augmented_images.append(images_np[i])
+        augmented_labels.append(train_labels[i].item() if isinstance(train_labels[i], torch.Tensor) else train_labels[i])
+        
+        # Add noisy variant for selected samples
+        if i in augment_indices:
+            noisy_img = generate_noisy_images(images_np[i:i+1], noise_schedule)[0]
+            augmented_images.append(noisy_img)
+            augmented_labels.append(train_labels[i].item() if isinstance(train_labels[i], torch.Tensor) else train_labels[i])
+    
+    # Convert to tensors
+    augmented_images_tensor = torch.tensor(np.array(augmented_images), dtype=torch.float32).permute(0, 3, 1, 2)
+    augmented_labels_tensor = torch.tensor(augmented_labels, dtype=torch.long)
+    
+    # Create dataset and loader
+    augmented_dataset = TensorDataset(augmented_images_tensor, augmented_labels_tensor)
+    augmented_loader = DataLoader(augmented_dataset, batch_size=batch_size, shuffle=True)
+    
+    return augmented_loader
+
+
+def train_robust_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=10, device='cpu'):
+    """Train model with standard training (for comparison baseline)."""
+    model.to(device)
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        all_labels = []
+        all_preds = []
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(predicted.cpu().numpy())
+        
+        epoch_loss = running_loss / len(train_loader)
+        y_true = np.concatenate(all_labels)
+        y_pred = np.concatenate(all_preds)
+        metrics = compute_metrics(y_true, y_pred, prefix=f'Train Epoch {epoch+1}', print_results=False)
+        test_metrics = evaluate_model(model, test_loader, device=device, prefix=f'Test Epoch {epoch+1}')
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+        print(f"  Train -> Accuracy: {metrics['accuracy']:.2f}%, F1: {metrics['f1']:.2f}%")
+        print(f"  Test  -> Accuracy: {test_metrics['accuracy']:.2f}%, F1: {test_metrics['f1']:.2f}%")
+
+
+def compare_robustness(baseline_model, robust_model, test_images, test_labels, noise_schedule, batch_size=64, device='cpu'):
+    """
+    Compare robustness between baseline (standard training) and robust model (noise-augmented training).
+    
+    Returns:
+    --------
+    comparison_dict : dict
+        Performance metrics for both models on clean and noisy data
+    """
+    # Evaluate baseline model
+    clean_baseline, noisy_baseline, deg_baseline = evaluate_robustness(
+        baseline_model, test_images, test_labels, noise_schedule, batch_size, device
+    )
+    
+    # Evaluate robust model
+    clean_robust, noisy_robust, deg_robust = evaluate_robustness(
+        robust_model, test_images, test_labels, noise_schedule, batch_size, device
+    )
+    
+    return {
+        'baseline': {
+            'clean': clean_baseline,
+            'noisy': noisy_baseline,
+            'degradation': deg_baseline,
+        },
+        'robust': {
+            'clean': clean_robust,
+            'noisy': noisy_robust,
+            'degradation': deg_robust,
+        }
+    }
+
+
+def print_robustness_comparison(comparison_dict, noise_schedule, augmentation_ratio):
+    """Print detailed comparison of baseline vs noise-robust models."""
+    baseline = comparison_dict['baseline']
+    robust = comparison_dict['robust']
+    
+    print("\n" + "="*120)
+    print("ROBUSTNESS COMPARISON: BASELINE vs NOISE-AUGMENTED TRAINING")
+    print("="*120)
+    print(f"\nTraining Strategy:")
+    print(f"  - Baseline: Standard training on clean dataset only")
+    print(f"  - Robust: Noise-augmented training with {augmentation_ratio*100:.0f}% perturbed samples")
+    print(f"  - Noise Configuration: {noise_schedule}")
+    
+    print("\n" + "-"*120)
+    print("CLEAN IMAGES (Test Set)")
+    print("-"*120)
+    print(f"{'Metric':<20} {'Baseline':<25} {'Noise-Augmented':<25} {'Improvement':<25}")
+    print("-"*120)
+    for metric in ['accuracy', 'precision', 'recall', 'f1']:
+        baseline_val = baseline['clean'][metric]
+        robust_val = robust['clean'][metric]
+        improvement = robust_val - baseline_val
+        print(f"{metric.upper():<20} {baseline_val:<25.2f} {robust_val:<25.2f} {improvement:+25.2f}")
+    
+    print("\n" + "-"*120)
+    print("NOISY IMAGES (Test Set)")
+    print("-"*120)
+    print(f"{'Metric':<20} {'Baseline':<25} {'Noise-Augmented':<25} {'Improvement':<25}")
+    print("-"*120)
+    for metric in ['accuracy', 'precision', 'recall', 'f1']:
+        baseline_val = baseline['noisy'][metric]
+        robust_val = robust['noisy'][metric]
+        improvement = robust_val - baseline_val
+        print(f"{metric.upper():<20} {baseline_val:<25.2f} {robust_val:<25.2f} {improvement:+25.2f}")
+    
+    print("\n" + "-"*120)
+    print("ROBUSTNESS (Noisy / Clean Accuracy)")
+    print("-"*120)
+    baseline_robustness = (baseline['noisy']['accuracy'] / baseline['clean']['accuracy'] * 100) if baseline['clean']['accuracy'] > 0 else 0
+    robust_robustness = (robust['noisy']['accuracy'] / robust['clean']['accuracy'] * 100) if robust['clean']['accuracy'] > 0 else 0
+    robustness_gain = robust_robustness - baseline_robustness
+    print(f"  Baseline Robustness:       {baseline_robustness:.2f}%")
+    print(f"  Noise-Augmented Robustness: {robust_robustness:.2f}%")
+    print(f"  Improvement:               {robustness_gain:+.2f}%")
+    
+    print("\n" + "-"*120)
+    print("PERFORMANCE DEGRADATION (Clean - Noisy)")
+    print("-"*120)
+    print(f"{'Metric':<20} {'Baseline':<25} {'Noise-Augmented':<25} {'Reduction':<25}")
+    print("-"*120)
+    for metric in ['accuracy', 'precision', 'recall', 'f1']:
+        baseline_val = baseline['degradation'][metric]
+        robust_val = robust['degradation'][metric]
+        reduction = baseline_val - robust_val  # Lower degradation is better
+        print(f"{metric.upper():<20} {baseline_val:<25.2f} {robust_val:<25.2f} {reduction:+25.2f}")
+    
+    print("="*120 + "\n")
+
+
 if __name__ == "__main__":
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -660,13 +850,68 @@ if __name__ == "__main__":
     # Print robustness report
     print_robustness_report(clean_metrics, noisy_metrics, degradation, noise_schedule)
 
-#     Question A2. Using the trained model from Question A1, evaluate robustness to noise
-# by injecting additive Gaussian noise into the test images. Use zero-mean Gaussian noise
-# with variance σ2 = 0.05, assuming input images are normalized to the range [0,1]. Test
-# the model on the noisy test set and report the resulting performance. Clearly document
-# and store the noise generation process and parameters (noise schedule), as this will be
-# reused in subsequent experiments. ---------------------------------STARTS HERE
+    # Question A2. ---------------------------------Ends HERE
 
+    # ============================= QUESTION A3: IMPROVED TRAINING STRATEGY =============================
+    print("\n\n" + "="*120)
+    print("QUESTION A3: IMPROVED TRAINING STRATEGY - NOISE-AUGMENTED TRAINING")
+    print("="*120)
+    
+    print("\n📋 STRATEGY JUSTIFICATION:")
+    print("-"*120)
+    print("""
+    Problem: Standard models trained on clean data show significant performance degradation
+    when tested on noisy images (as observed in A2).
+    
+    Solution: Noise-Augmented Training Strategy
+    - Augment training set by adding noise-perturbed copies of a subset of samples
+    - Maintains distribution close to clean dataset (1-α clean + α noisy, where α is augmentation ratio)
+    - Exposes model to noise during training, improving robustness without full retraining on noise
+    - More efficient than fully retraining on all-noisy data
+    
+    Implementation:
+    1. Select α fraction of training samples (default: 20%)
+    2. For each selected sample: keep original AND add noisy variant
+    3. Train new model on augmented dataset (clean + noisy samples)
+    4. Compare robustness with baseline model
+    """)
+    print("-"*120)
+    
+    # Create a new baseline model for comparison
+    print("\nTraining baseline model (clean data only)...")
+    baseline_model = SimpleCNN(num_classes=100)
+    baseline_criterion = nn.CrossEntropyLoss()
+    baseline_optimizer = optim.Adam(baseline_model.parameters(), lr=0.001)
+    
+    train_robust_model(baseline_model, train_loader, test_loader, baseline_criterion, 
+                      baseline_optimizer, num_epochs=3, device=device)
+    
+    # Create augmented training loader
+    augmentation_ratio = 0.2  # 20% augmentation ratio
+    print(f"\nCreating augmented training dataset (augmentation ratio: {augmentation_ratio*100:.0f}%)...")
+    augmented_train_loader = create_augmented_training_loader(
+        train_images, train_labels, noise_schedule, 
+        augmentation_ratio=augmentation_ratio, batch_size=64
+    )
+    print(f"  Augmented dataset size: {len(augmented_train_loader.dataset)} samples (1.2x original)")
+    
+    # Train robust model on augmented data
+    print("\nTraining robust model (clean + noise-augmented data)...")
+    robust_model = SimpleCNN(num_classes=100)
+    robust_criterion = nn.CrossEntropyLoss()
+    robust_optimizer = optim.Adam(robust_model.parameters(), lr=0.001)
+    
+    train_robust_model(robust_model, augmented_train_loader, test_loader, robust_criterion, 
+                      robust_optimizer, num_epochs=3, device=device)
+    
+    # Compare robustness
+    print("\nComparing robustness: Baseline vs Noise-Augmented...")
+    comparison = compare_robustness(baseline_model, robust_model, test_images, test_labels, 
+                                   noise_schedule, batch_size=64, device=device)
+    
+    # Print detailed comparison
+    print_robustness_comparison(comparison, noise_schedule, augmentation_ratio)
+    # Question A3. ---------------------------------Ends HERE
 
 
     
