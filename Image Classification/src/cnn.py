@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 DATASET_DIR = Path(__file__).resolve().parent.parent / "cifar-100-python"
+NUM_EPOCHS = 1
 
 
 def load_cifar100(split="train", dataset_dir=DATASET_DIR):
@@ -331,7 +332,7 @@ def print_confusion_matrix(cm, prefix='Confusion Matrix'):
     np.set_printoptions(**old_opts)
 
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=10, device='cpu'):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=NUM_EPOCHS, device='cpu'):
     model.to(device)
     for epoch in range(num_epochs):
         model.train()
@@ -386,7 +387,7 @@ def evaluate_model(model, data_loader, device='cpu', prefix='Test', return_confu
 
 def get_vgg_feature_extractor(device='cpu'):
     """Load pretrained VGG and freeze convolutional feature extraction layers."""
-    vgg = models.vgg16(pretrained=True)
+    vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
     for param in vgg.parameters():
         param.requires_grad = False
 
@@ -400,12 +401,16 @@ def get_vgg_feature_extractor(device='cpu'):
     return feature_extractor
 
 
-def preprocess_vgg_inputs(images):
-    """Resize CIFAR images and apply ImageNet normalization for VGG."""
+def preprocess_vgg_inputs(images, resize_to=None):
+    """Apply ImageNet normalization for VGG (optional resize)."""
     if not isinstance(images, torch.Tensor):
         images = torch.tensor(images, dtype=torch.float32)
     images = images.to(torch.float32)
-    images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+
+    # CIFAR-100 images are 32x32 and VGG can process them directly.
+    # Upsampling to 224x224 dramatically increases runtime with limited benefit here.
+    if resize_to is not None:
+        images = F.interpolate(images, size=resize_to, mode='bilinear', align_corners=False)
 
     mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=images.device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=images.device).view(1, 3, 1, 1)
@@ -413,19 +418,34 @@ def preprocess_vgg_inputs(images):
     return images
 
 
-def extract_vgg_features(feature_extractor, images, batch_size=64, device='cpu'):
-    """Extract frozen VGG feature vectors for all images."""
+def extract_vgg_features(feature_extractor, images, batch_size=64, device='cpu', resize_to=None, cache_path=None):
+    """Extract frozen VGG feature vectors for all images, with optional disk cache."""
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        if cache_path.exists():
+            print(f"Loading cached VGG features from: {cache_path}")
+            return torch.load(cache_path, map_location='cpu')
+
     feature_extractor.to(device)
     feature_extractor.eval()
     features = []
+    total_batches = (len(images) + batch_size - 1) // batch_size
     with torch.no_grad():
-        for start in range(0, len(images), batch_size):
+        for batch_index, start in enumerate(range(0, len(images), batch_size), start=1):
             batch = images[start:start + batch_size].to(device)
-            batch = preprocess_vgg_inputs(batch)
+            batch = preprocess_vgg_inputs(batch, resize_to=resize_to)
             feats = feature_extractor(batch)
             features.append(feats.cpu())
+            if batch_index == 1 or batch_index % 25 == 0 or batch_index == total_batches:
+                print(f"  VGG feature extraction progress: batch {batch_index}/{total_batches}")
+    features = torch.cat(features, dim=0)
 
-    return torch.cat(features, dim=0)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(features, cache_path)
+        print(f"Saved VGG features cache to: {cache_path}")
+
+    return features
 
 
 class MLPClassifier(nn.Module):
@@ -694,7 +714,7 @@ def create_augmented_training_loader(train_images, train_labels, noise_schedule,
     return augmented_loader
 
 
-def train_robust_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=10, device='cpu'):
+def train_robust_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=NUM_EPOCHS, device='cpu'):
     """Train model with standard training (for comparison baseline)."""
     model.to(device)
     for epoch in range(num_epochs):
@@ -873,7 +893,7 @@ if __name__ == "__main__":
     
     # Train the model
     print("Starting training...")
-    train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=3, device=device)
+    train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=NUM_EPOCHS, device=device)
     
     # Final evaluation
     print("Final evaluation on train set...")
@@ -945,7 +965,7 @@ if __name__ == "__main__":
     baseline_optimizer = optim.Adam(baseline_model.parameters(), lr=0.001)
     
     train_robust_model(baseline_model, train_loader, test_loader, baseline_criterion, 
-                      baseline_optimizer, num_epochs=3, device=device)
+                      baseline_optimizer, num_epochs=NUM_EPOCHS, device=device)
     
     # Create augmented training loader
     augmentation_ratio = 0.2  # 20% augmentation ratio
@@ -963,7 +983,7 @@ if __name__ == "__main__":
     robust_optimizer = optim.Adam(robust_model.parameters(), lr=0.001)
     
     train_robust_model(robust_model, augmented_train_loader, test_loader, robust_criterion, 
-                      robust_optimizer, num_epochs=3, device=device)
+                      robust_optimizer, num_epochs=NUM_EPOCHS, device=device)
     
     # Compare robustness
     print("\nComparing robustness: Baseline vs Noise-Augmented...")
@@ -986,11 +1006,27 @@ if __name__ == "__main__":
 
     # Build VGG feature extractor and freeze convolutional parameters
     vgg_feature_extractor = get_vgg_feature_extractor(device=device)
+    vgg_batch_size = 128
+    vgg_cache_dir = Path(__file__).resolve().parent / "cache"
 
     print("\nExtracting features from training images using VGG16...")
-    train_features = extract_vgg_features(vgg_feature_extractor, train_images, batch_size=64, device=device)
+    train_features = extract_vgg_features(
+        vgg_feature_extractor,
+        train_images,
+        batch_size=vgg_batch_size,
+        device=device,
+        resize_to=None,
+        cache_path=vgg_cache_dir / "vgg16_train_features.pt",
+    )
     print("Extracting features from test images using VGG16...")
-    test_features = extract_vgg_features(vgg_feature_extractor, test_images, batch_size=64, device=device)
+    test_features = extract_vgg_features(
+        vgg_feature_extractor,
+        test_images,
+        batch_size=vgg_batch_size,
+        device=device,
+        resize_to=None,
+        cache_path=vgg_cache_dir / "vgg16_test_features.pt",
+    )
     print(f"  Train feature shape: {train_features.shape}")
     print(f"  Test feature shape: {test_features.shape}")
 
@@ -1002,7 +1038,7 @@ if __name__ == "__main__":
     vgg_optimizer = optim.Adam(vgg_mlp.parameters(), lr=0.001)
 
     print("\nTraining the MLP classifier on VGG features...")
-    train_model(vgg_mlp, train_feature_loader, test_feature_loader, vgg_criterion, vgg_optimizer, num_epochs=3, device=device)
+    train_model(vgg_mlp, train_feature_loader, test_feature_loader, vgg_criterion, vgg_optimizer, num_epochs=NUM_EPOCHS, device=device)
 
     print("\nFinal evaluation of VGG+MLP on test set...")
     vgg_test_metrics, vgg_test_cm = evaluate_model(vgg_mlp, test_feature_loader, device=device, prefix='VGG+MLP Final Test', return_confusion=True)
@@ -1018,6 +1054,78 @@ if __name__ == "__main__":
     print(f"  F1 change:        {vgg_test_metrics['f1'] - test_metrics['f1']:+.2f}%")
     print("="*120 + "\n")
     # Question A4. ---------------------------------Ends HERE
+
+    # ============================= QUESTION A5: VGG ROBUSTNESS UNDER NOISY TEST IMAGES =============================
+    print("\n\n" + "="*120)
+    print("QUESTION A5: ROBUSTNESS OF TRANSFER LEARNING UNDER ADDITIVE GAUSSIAN NOISE")
+    print("="*120)
+    print("\nUsing the same noise parameters as A2 (mean=0.0, variance=0.05), evaluate VGG+MLP on noisy test images and compare with CNN-from-scratch robustness.")
+
+    print("\nGenerating noisy test images using A2 noise schedule...")
+    noisy_test_loader = create_noisy_dataloader(test_images, test_labels, noise_schedule, batch_size=batch_size)
+    noisy_test_images = noisy_test_loader.dataset.tensors[0]
+
+    print("Extracting VGG features from noisy test images...")
+    noisy_test_features = extract_vgg_features(
+        vgg_feature_extractor,
+        noisy_test_images,
+        batch_size=vgg_batch_size,
+        device=device,
+        resize_to=None,
+        cache_path=vgg_cache_dir / f"vgg16_noisy_test_features_var_{noise_schedule.variance:.3f}_mean_{noise_schedule.mean:.3f}.pt",
+    )
+    noisy_test_feature_loader = DataLoader(
+        TensorDataset(noisy_test_features, test_labels),
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    print("\nEvaluating VGG+MLP on noisy test features...")
+    vgg_noisy_metrics, _ = evaluate_model(
+        vgg_mlp,
+        noisy_test_feature_loader,
+        device=device,
+        prefix=f'VGG+MLP Noisy Test (σ²={noise_schedule.variance})',
+        return_confusion=True
+    )
+
+    vgg_degradation = {
+        'accuracy': vgg_test_metrics['accuracy'] - vgg_noisy_metrics['accuracy'],
+        'precision': vgg_test_metrics['precision'] - vgg_noisy_metrics['precision'],
+        'recall': vgg_test_metrics['recall'] - vgg_noisy_metrics['recall'],
+        'f1': vgg_test_metrics['f1'] - vgg_noisy_metrics['f1'],
+    }
+
+    print("\nA5 ROBUSTNESS REPORT: VGG TRANSFER VS CNN FROM SCRATCH")
+    print("-"*120)
+    print(f"{'Model':<24} {'Clean Acc (%)':<16} {'Noisy Acc (%)':<16} {'Accuracy Drop (%)':<18} {'Robustness Ratio (%)':<20}")
+    print("-"*120)
+
+    cnn_robustness_ratio = (noisy_metrics['accuracy'] / clean_metrics['accuracy'] * 100) if clean_metrics['accuracy'] > 0 else 0.0
+    vgg_robustness_ratio = (vgg_noisy_metrics['accuracy'] / vgg_test_metrics['accuracy'] * 100) if vgg_test_metrics['accuracy'] > 0 else 0.0
+
+    print(f"{'CNN (from scratch)':<24} {clean_metrics['accuracy']:<16.2f} {noisy_metrics['accuracy']:<16.2f} {degradation['accuracy']:<18.2f} {cnn_robustness_ratio:<20.2f}")
+    print(f"{'VGG16 + MLP (TL)':<24} {vgg_test_metrics['accuracy']:<16.2f} {vgg_noisy_metrics['accuracy']:<16.2f} {vgg_degradation['accuracy']:<18.2f} {vgg_robustness_ratio:<20.2f}")
+    print("-"*120)
+
+    print("\nDetailed degradation comparison (Clean - Noisy):")
+    print(f"{'Metric':<12} {'CNN Drop':<16} {'VGG+MLP Drop':<16} {'Difference (VGG-CNN)':<22}")
+    print("-"*120)
+    for metric in ['accuracy', 'precision', 'recall', 'f1']:
+        diff = vgg_degradation[metric] - degradation[metric]
+        print(f"{metric.capitalize():<12} {degradation[metric]:<16.2f} {vgg_degradation[metric]:<16.2f} {diff:<22.2f}")
+    print("-"*120)
+
+    print("\nA5 Conclusion:")
+    if vgg_degradation['accuracy'] < degradation['accuracy']:
+        print("  VGG-based transfer learning is MORE robust than CNN-from-scratch under the same Gaussian noise setting.")
+    elif vgg_degradation['accuracy'] > degradation['accuracy']:
+        print("  VGG-based transfer learning is LESS robust than CNN-from-scratch under the same Gaussian noise setting.")
+    else:
+        print("  VGG-based transfer learning and CNN-from-scratch show comparable robustness under the same Gaussian noise setting.")
+    print("="*120 + "\n")
+    # Question A5. ---------------------------------Ends HERE
+
 
 
     
