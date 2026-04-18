@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from nltk.stem import PorterStemmer
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
@@ -18,6 +19,7 @@ DATASET_DIR = Path(__file__).resolve().parent.parent / "aclImdb"
 VOCAB_FILE = DATASET_DIR / "imdb.vocab"
 PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
+STEMMER = PorterStemmer()
 
 
 def set_seed(seed: int = 42) -> None:
@@ -35,12 +37,17 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def normalize_token(token: str) -> str:
+    return STEMMER.stem(token)
+
+
 def tokenize(text: str) -> list[str]:
-    return clean_text(text).split()
+    return [normalize_token(token) for token in clean_text(text).split()]
 
 
 @dataclass
 class ReviewExample:
+    text: str
     tokens: list[str]
     label: int
 
@@ -55,7 +62,7 @@ def read_imdb_split(split_dir: Path, max_samples_per_label: int | None = None) -
         for review_path in review_paths:
             text = review_path.read_text(encoding="utf-8", errors="ignore")
             tokens = tokenize(text)
-            examples.append(ReviewExample(tokens=tokens, label=label_value))
+            examples.append(ReviewExample(text=text.strip(), tokens=tokens, label=label_value))
     return examples
 
 
@@ -66,7 +73,7 @@ def load_vocab_from_file(vocab_path: Path, max_vocab_size: int = 20_000) -> dict
     vocab = {PAD_TOKEN: 0, UNK_TOKEN: 1}
     with vocab_path.open("r", encoding="utf-8", errors="ignore") as vocab_file:
         for line in vocab_file:
-            token = line.strip().lower()
+            token = normalize_token(line.strip().lower())
             if not token or token in vocab:
                 continue
             if len(vocab) >= max_vocab_size:
@@ -201,6 +208,44 @@ def compute_metrics(labels: list[int], predictions: list[int]) -> dict[str, floa
     }
 
 
+def preview_test_predictions(
+    model: nn.Module,
+    examples: list[ReviewExample],
+    vocab: dict[str, int],
+    device: torch.device,
+    max_length: int,
+    num_samples: int = 3,
+) -> None:
+    model.eval()
+    unk_index = vocab[UNK_TOKEN]
+    label_names = {0: "negative", 1: "positive"}
+
+    print("=" * 90)
+    print("SAMPLE TEST PREDICTIONS")
+    print("=" * 90)
+
+    with torch.no_grad():
+        for sample_index, example in enumerate(examples[:num_samples], start=1):
+            token_ids = [vocab.get(token, unk_index) for token in example.tokens[:max_length]]
+            if not token_ids:
+                token_ids = [unk_index]
+
+            inputs = torch.tensor([token_ids], dtype=torch.long, device=device)
+            lengths = torch.tensor([len(token_ids)], dtype=torch.long, device=device)
+            logits, _ = model(inputs, lengths)
+            probability = torch.sigmoid(logits).item()
+            prediction = 1 if probability >= 0.5 else 0
+
+            preview_lines = [line.strip() for line in example.text.splitlines() if line.strip()]
+            preview_text = " ".join(preview_lines[:3])
+
+            print(f"Sample {sample_index}:")
+            print(f"  True label: {label_names[example.label]}")
+            print(f"  Predicted label: {label_names[prediction]} (positive probability: {probability:.4f})")
+            print(f"  Review preview: {preview_text[:300]}")
+            print()
+
+
 def evaluate_model(
     model: nn.Module,
     dataloader: DataLoader,
@@ -235,10 +280,13 @@ def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
+    test_examples: list[ReviewExample],
+    vocab: dict[str, int],
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
     num_epochs: int,
+    max_length: int,
 ) -> None:
     model.to(device)
 
@@ -285,6 +333,14 @@ def train_model(
             f"Recall: {test_metrics['recall']:.2f}% | "
             f"F1: {test_metrics['f1']:.2f}%"
         )
+
+    preview_test_predictions(
+        model=model,
+        examples=test_examples,
+        vocab=vocab,
+        device=device,
+        max_length=max_length,
+    )
 
 
 def print_dataset_summary(train_examples: list[ReviewExample], test_examples: list[ReviewExample], vocab: dict[str, int]) -> None:
@@ -418,10 +474,13 @@ def main() -> None:
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
+        test_examples=test_examples,
+        vocab=vocab,
         optimizer=optimizer,
         criterion=criterion,
         device=device,
         num_epochs=args.epochs,
+        max_length=args.max_length,
     )
 
 
