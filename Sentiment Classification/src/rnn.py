@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import random
 import re
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 
 DATASET_DIR = Path(__file__).resolve().parent.parent / "aclImdb"
+VOCAB_FILE = DATASET_DIR / "imdb.vocab"
 PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
 
@@ -59,22 +59,19 @@ def read_imdb_split(split_dir: Path, max_samples_per_label: int | None = None) -
     return examples
 
 
-def build_vocab(
-    examples: list[ReviewExample],
-    max_vocab_size: int = 20_000,
-    min_freq: int = 2,
-) -> dict[str, int]:
-    counter = Counter()
-    for example in examples:
-        counter.update(example.tokens)
+def load_vocab_from_file(vocab_path: Path, max_vocab_size: int = 20_000) -> dict[str, int]:
+    if not vocab_path.exists():
+        raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}")
 
     vocab = {PAD_TOKEN: 0, UNK_TOKEN: 1}
-    for token, freq in counter.most_common():
-        if freq < min_freq:
-            continue
-        if len(vocab) >= max_vocab_size:
-            break
-        vocab[token] = len(vocab)
+    with vocab_path.open("r", encoding="utf-8", errors="ignore") as vocab_file:
+        for line in vocab_file:
+            token = line.strip().lower()
+            if not token or token in vocab:
+                continue
+            if len(vocab) >= max_vocab_size:
+                break
+            vocab[token] = len(vocab)
     return vocab
 
 
@@ -307,16 +304,16 @@ def print_dataset_summary(train_examples: list[ReviewExample], test_examples: li
 
 def build_dataloaders(
     dataset_dir: Path,
+    vocab_path: Path,
     batch_size: int,
     max_vocab_size: int,
-    min_freq: int,
     max_length: int,
     max_train_per_label: int | None,
     max_test_per_label: int | None,
 ) -> tuple[DataLoader, DataLoader, dict[str, int], list[ReviewExample], list[ReviewExample]]:
     train_examples = read_imdb_split(dataset_dir / "train", max_samples_per_label=max_train_per_label)
     test_examples = read_imdb_split(dataset_dir / "test", max_samples_per_label=max_test_per_label)
-    vocab = build_vocab(train_examples, max_vocab_size=max_vocab_size, min_freq=min_freq)
+    vocab = load_vocab_from_file(vocab_path, max_vocab_size=max_vocab_size)
 
     train_dataset = IMDBDataset(train_examples, vocab=vocab, max_length=max_length)
     test_dataset = IMDBDataset(test_examples, vocab=vocab, max_length=max_length)
@@ -336,6 +333,7 @@ def print_model_description(args: argparse.Namespace, vocab_size: int) -> None:
     print("MODEL CONFIGURATION")
     print("=" * 90)
     print(f"Architecture: {model_names[args.model]}")
+    print(f"Vocabulary source: {args.vocab_file}")
     print(f"Vocabulary size: {vocab_size}")
     print(f"Embedding dimension: {args.embedding_dim}")
     print(f"Hidden dimension: {args.hidden_dim}")
@@ -351,6 +349,7 @@ def print_model_description(args: argparse.Namespace, vocab_size: int) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="IMDB sentiment classification with RNN/LSTM/Attention.")
     parser.add_argument("--dataset-dir", type=Path, default=DATASET_DIR, help="Path to the extracted aclImdb dataset.")
+    parser.add_argument("--vocab-file", type=Path, default=VOCAB_FILE, help="Path to the imdb.vocab file.")
     parser.add_argument("--model", choices=["rnn", "lstm", "lstm_attention"], default="lstm")
     parser.add_argument("--embedding-dim", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -361,7 +360,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--max-vocab-size", type=int, default=20_000)
-    parser.add_argument("--min-freq", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=300)
     parser.add_argument("--max-train-per-label", type=int, default=None)
     parser.add_argument("--max-test-per-label", type=int, default=None)
@@ -390,9 +388,9 @@ def main() -> None:
     device = resolve_device(args.device)
     train_loader, test_loader, vocab, train_examples, test_examples = build_dataloaders(
         dataset_dir=args.dataset_dir,
+        vocab_path=args.vocab_file,
         batch_size=args.batch_size,
         max_vocab_size=args.max_vocab_size,
-        min_freq=args.min_freq,
         max_length=args.max_length,
         max_train_per_label=args.max_train_per_label,
         max_test_per_label=args.max_test_per_label,
