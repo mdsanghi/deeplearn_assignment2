@@ -5,7 +5,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import torchvision.models as models
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -381,6 +383,65 @@ def evaluate_model(model, data_loader, device='cpu', prefix='Test', return_confu
         # print_confusion_matrix(cm, prefix=f'{prefix} Confusion Matrix')
         return metrics, cm
     return metrics
+
+def get_vgg_feature_extractor(device='cpu'):
+    """Load pretrained VGG and freeze convolutional feature extraction layers."""
+    vgg = models.vgg16(pretrained=True)
+    for param in vgg.parameters():
+        param.requires_grad = False
+
+    feature_extractor = nn.Sequential(
+        vgg.features,
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten()
+    )
+    feature_extractor.to(device)
+    feature_extractor.eval()
+    return feature_extractor
+
+
+def preprocess_vgg_inputs(images):
+    """Resize CIFAR images and apply ImageNet normalization for VGG."""
+    if not isinstance(images, torch.Tensor):
+        images = torch.tensor(images, dtype=torch.float32)
+    images = images.to(torch.float32)
+    images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=images.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=images.device).view(1, 3, 1, 1)
+    images = (images - mean) / std
+    return images
+
+
+def extract_vgg_features(feature_extractor, images, batch_size=64, device='cpu'):
+    """Extract frozen VGG feature vectors for all images."""
+    feature_extractor.to(device)
+    feature_extractor.eval()
+    features = []
+    with torch.no_grad():
+        for start in range(0, len(images), batch_size):
+            batch = images[start:start + batch_size].to(device)
+            batch = preprocess_vgg_inputs(batch)
+            feats = feature_extractor(batch)
+            features.append(feats.cpu())
+
+    return torch.cat(features, dim=0)
+
+
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=256, num_classes=100):
+        super(MLPClassifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = torch.relu(self.bn1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
 
 # ================================ NOISE INJECTION FOR ROBUSTNESS TESTING ================================
@@ -912,6 +973,51 @@ if __name__ == "__main__":
     # Print detailed comparison
     print_robustness_comparison(comparison, noise_schedule, augmentation_ratio)
     # Question A3. ---------------------------------Ends HERE
+
+
+    # ============================= QUESTION A4: TRANSFER LEARNING WITH VGG =============================
+    print("\n\n" + "="*120)
+    print("QUESTION A4: TRANSFER LEARNING USING PRETRAINED VGG FEATURE EXTRACTOR")
+    print("="*120)
+    print("\n📋 STRATEGY:")
+    print("-"*120)
+    print("Using a pre-trained VGG16 model as a frozen feature extractor, we extract compact deep features from CIFAR-100 images. A small MLP classifier is trained on these features, while the convolutional backbone remains fixed.")
+    print("-"*120)
+
+    # Build VGG feature extractor and freeze convolutional parameters
+    vgg_feature_extractor = get_vgg_feature_extractor(device=device)
+
+    print("\nExtracting features from training images using VGG16...")
+    train_features = extract_vgg_features(vgg_feature_extractor, train_images, batch_size=64, device=device)
+    print("Extracting features from test images using VGG16...")
+    test_features = extract_vgg_features(vgg_feature_extractor, test_images, batch_size=64, device=device)
+    print(f"  Train feature shape: {train_features.shape}")
+    print(f"  Test feature shape: {test_features.shape}")
+
+    train_feature_loader = DataLoader(TensorDataset(train_features, train_labels), batch_size=batch_size, shuffle=True)
+    test_feature_loader = DataLoader(TensorDataset(test_features, test_labels), batch_size=batch_size, shuffle=False)
+
+    vgg_mlp = MLPClassifier(input_dim=train_features.shape[1], hidden_dim=256, num_classes=100)
+    vgg_criterion = nn.CrossEntropyLoss()
+    vgg_optimizer = optim.Adam(vgg_mlp.parameters(), lr=0.001)
+
+    print("\nTraining the MLP classifier on VGG features...")
+    train_model(vgg_mlp, train_feature_loader, test_feature_loader, vgg_criterion, vgg_optimizer, num_epochs=3, device=device)
+
+    print("\nFinal evaluation of VGG+MLP on test set...")
+    vgg_test_metrics, vgg_test_cm = evaluate_model(vgg_mlp, test_feature_loader, device=device, prefix='VGG+MLP Final Test', return_confusion=True)
+
+    print("\nSUMMARY COMPARISON WITH CNN TRAINED FROM SCRATCH")
+    print("-"*120)
+    print(f"CNN baseline test accuracy: {test_metrics['accuracy']:.2f}%")
+    print(f"VGG+MLP test accuracy:       {vgg_test_metrics['accuracy']:.2f}%")
+    print("\nComparison of test performance:")
+    print(f"  Accuracy change: {vgg_test_metrics['accuracy'] - test_metrics['accuracy']:+.2f}%")
+    print(f"  Precision change: {vgg_test_metrics['precision'] - test_metrics['precision']:+.2f}%")
+    print(f"  Recall change:    {vgg_test_metrics['recall'] - test_metrics['recall']:+.2f}%")
+    print(f"  F1 change:        {vgg_test_metrics['f1'] - test_metrics['f1']:+.2f}%")
+    print("="*120 + "\n")
+    # Question A4. ---------------------------------Ends HERE
 
 
     
